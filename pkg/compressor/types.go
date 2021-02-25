@@ -22,6 +22,8 @@ const (
 	LzwCompressionPolicy = "lzw"
 	// ZlibCompressionPolicy is constant for zlib compression algorithm.
 	ZlibCompressionPolicy = "zlib"
+	// SnappyCompressionPolicy is constant for snappy compression algorithm.
+	SnappyCompressionPolicy = "snappy"
 
 	// DefaultCompression is constant used for whether to compress the snapshots or not.
 	DefaultCompression = false
@@ -36,6 +38,8 @@ const (
 	LzwCompressionExtension = ".Z"
 	// ZlibCompressionExtension is used for snapshot suffix when compressionPolicy is zlib.
 	ZlibCompressionExtension = ".zlib"
+	// SnappyCompressionExtension is used for snapshot suffix when compressionPolicy is snappy.
+	SnappyCompressionExtension = ".sz"
 	// Reference: https://en.wikipedia.org/wiki/List_of_archive_formats
 
 	// LzwLiteralWidth is constant used as literal Width in lzw compressionPolicy.

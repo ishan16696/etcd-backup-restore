@@ -20,7 +20,9 @@ import (
 	"compress/zlib"
 	"fmt"
 	"io"
+	"io/ioutil"
 
+	"github.com/golang/snappy"
 	"github.com/sirupsen/logrus"
 )
 
@@ -34,6 +36,9 @@ func CompressSnapshot(data io.ReadCloser, compressionPolicy string) (io.ReadClos
 	logger.Infof("start compressing the snapshot using %v Compression Policy", compressionPolicy)
 
 	switch compressionPolicy {
+	case SnappyCompressionPolicy:
+		gWriter = snappy.NewWriter(pWriter)
+
 	case GzipCompressionPolicy:
 		gWriter = gzip.NewWriter(pWriter)
 
@@ -75,6 +80,9 @@ func DecompressSnapshot(data io.ReadCloser, compressionPolicy string) (io.ReadCl
 	logger.Infof("start decompressing the snapshot with %v compressionPolicy", compressionPolicy)
 
 	switch compressionPolicy {
+	case SnappyCompressionPolicy:
+		deCompressedData = ioutil.NopCloser(snappy.NewReader(data))
+
 	case ZlibCompressionPolicy:
 		deCompressedData, err = zlib.NewReader(data)
 		if err != nil {
@@ -110,6 +118,9 @@ func GetCompressionSuffix(compressionEnabled bool, compressionPolicy string) (st
 	}
 
 	switch compressionPolicy {
+	case SnappyCompressionPolicy:
+		return SnappyCompressionExtension, nil
+
 	case ZlibCompressionPolicy:
 		return ZlibCompressionExtension, nil
 
@@ -132,6 +143,9 @@ func GetCompressionSuffix(compressionEnabled bool, compressionPolicy string) (st
 func IsSnapshotCompressed(compressionSuffix string) (bool, string, error) {
 
 	switch compressionSuffix {
+	case SnappyCompressionExtension:
+		return true, SnappyCompressionPolicy, nil
+
 	case ZlibCompressionExtension:
 		return true, ZlibCompressionPolicy, nil
 

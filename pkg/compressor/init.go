@@ -43,7 +43,7 @@ func (c *CompressionConfig) Validate() error {
 		return nil
 	}
 
-	for _, policy := range []string{GzipCompressionPolicy, ZlibCompressionPolicy, LzwCompressionPolicy} {
+	for _, policy := range []string{GzipCompressionPolicy, ZlibCompressionPolicy, LzwCompressionPolicy, SnappyCompressionPolicy} {
 		if c.CompressionPolicy == policy {
 			return nil
 		}
