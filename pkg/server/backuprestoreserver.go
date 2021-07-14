@@ -18,10 +18,12 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gardener/etcd-backup-restore/pkg/errors"
+	"github.com/gardener/etcd-backup-restore/pkg/leaderelection"
 	"github.com/gardener/etcd-backup-restore/pkg/metrics"
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 	"github.com/prometheus/client_golang/prometheus"
@@ -61,13 +63,13 @@ func NewBackupRestoreServer(logger *logrus.Logger, config *BackupRestoreComponen
 func (b *BackupRestoreServer) Run(ctx context.Context) error {
 	clusterURLsMap, err := types.NewURLsMap(b.config.RestorationConfig.InitialCluster)
 	if err != nil {
-		// Ideally this case should not occur, since this check is done at the config validaitions.
+		// Ideally this case should not occur, since this check is done at the config validations.
 		b.logger.Fatalf("failed creating url map for restore cluster: %v", err)
 	}
 
 	peerURLs, err := types.NewURLs(b.config.RestorationConfig.InitialAdvertisePeerURLs)
 	if err != nil {
-		// Ideally this case should not occur, since this check is done at the config validaitions.
+		// Ideally this case should not occur, since this check is done at the config validations.
 		b.logger.Fatalf("failed creating url map for restore cluster: %v", err)
 	}
 
@@ -102,6 +104,7 @@ func (b *BackupRestoreServer) startHTTPServer(initializer initializer.Initialize
 		EnableTLS:         (b.config.ServerConfig.TLSCertFile != "" && b.config.ServerConfig.TLSKeyFile != ""),
 		ServerTLSCertFile: b.config.ServerConfig.TLSCertFile,
 		ServerTLSKeyFile:  b.config.ServerConfig.TLSKeyFile,
+		HTTPHandlerMutex:  &sync.Mutex{},
 	}
 	handler.SetStatus(http.StatusServiceUnavailable)
 	b.logger.Info("Registering the http request handlers...")
@@ -133,6 +136,7 @@ func (b *BackupRestoreServer) runServerWithoutSnapshotter(ctx context.Context, r
 // for the case where snapshotter is configured correctly
 func (b *BackupRestoreServer) runServerWithSnapshotter(ctx context.Context, restoreOpts *brtypes.RestoreOptions) error {
 	ackCh := make(chan struct{})
+	ssrStopCh := make(chan struct{})
 
 	etcdInitializer := initializer.NewInitializer(restoreOpts, b.config.SnapstoreConfig, b.logger.Logger)
 
@@ -151,18 +155,46 @@ func (b *BackupRestoreServer) runServerWithSnapshotter(ctx context.Context, rest
 	handler := b.startHTTPServer(etcdInitializer, ssr)
 	defer handler.Stop()
 
-	ssrStopCh := make(chan struct{})
-	go handleSsrStopRequest(ctx, handler, ssr, ackCh, ssrStopCh)
+	leaderCallbacks := &leaderelection.LeaderCallbacks{
+		OnStartedLeading: func(leCtx context.Context) {
+			ssrStopCh = make(chan struct{})
+			// Get the new snapshotter object
+			ssr, err = snapshotter.NewSnapshotter(b.logger, b.config.SnapshotterConfig, ss, b.config.EtcdConnectionConfig, b.config.CompressionConfig)
+			if err != nil {
+				b.logger.Errorf("Failed to create new Snapshotter object: %v", err)
+				return
+			}
+			go b.runEtcdProbeLoopWithSnapshotter(leCtx, handler, ssr, ssrStopCh, ackCh)
+
+			go handleSsrStopRequest(leCtx, handler, ssr, ackCh, ssrStopCh)
+		},
+		OnStoppedLeading: func() {
+			// stops the running snapshotter
+			ssr.SsrStateMutex.Lock()
+			defer ssr.SsrStateMutex.Unlock()
+			if ssr.SsrState == brtypes.SnapshotterActive {
+				ssrStopCh <- emptyStruct
+				b.logger.Info("backup-restore stops leading...")
+			}
+			handler.SetSnapshotterToNil()
+		},
+	}
+
+	b.logger.Infof("Creating leaderElector...")
+	le, err := leaderelection.NewLeaderElector(b.logger, b.config.EtcdConnectionConfig, b.config.LeaderElectionConfig, leaderCallbacks)
+	if err != nil {
+		return err
+	}
+
 	go handleAckState(handler, ackCh)
 
 	go defragmentor.DefragDataPeriodically(ctx, b.config.EtcdConnectionConfig, b.defragmentationSchedule, ssr.TriggerFullSnapshot, b.logger)
 
-	b.runEtcdProbeLoopWithSnapshotter(ctx, handler, ssr, ssrStopCh, ackCh)
-	return nil
+	return le.Run(ctx)
 }
 
 // runEtcdProbeLoopWithSnapshotter runs the etcd probe loop
-// for the case where snapshotter is configured correctly
+// for the case when current backup-restore becomes leader backup-restore.
 func (b *BackupRestoreServer) runEtcdProbeLoopWithSnapshotter(ctx context.Context, handler *HTTPHandler, ssr *snapshotter.Snapshotter, ssrStopCh chan struct{}, ackCh chan struct{}) {
 	var (
 		err                       error

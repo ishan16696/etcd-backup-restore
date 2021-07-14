@@ -23,7 +23,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// CallbackFunc is type decalration for callback function for defragmentor
+// CallbackFunc is type declaration for callback function for defragmentor
 type CallbackFunc func(ctx context.Context) (*brtypes.Snapshot, error)
 
 // defragmentorJob implement the cron.Job for etcd defragmentation.

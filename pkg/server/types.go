@@ -17,6 +17,7 @@ package server
 import (
 	"github.com/gardener/etcd-backup-restore/pkg/compressor"
 	"github.com/gardener/etcd-backup-restore/pkg/etcdutil"
+	"github.com/gardener/etcd-backup-restore/pkg/leaderelection"
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 )
 
@@ -34,6 +35,7 @@ type BackupRestoreComponentConfig struct {
 	CompressionConfig       *compressor.CompressionConfig  `json:"compressionConfig,omitempty"`
 	RestorationConfig       *brtypes.RestorationConfig     `json:"restorationConfig,omitempty"`
 	DefragmentationSchedule string                         `json:"defragmentationSchedule"`
+	LeaderElectionConfig    *leaderelection.Config         `json:"leaderElectionConfig,omitempty"`
 }
 
 // latestSnapshotMetadata holds snapshot details of latest full and delta snapshots
