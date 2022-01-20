@@ -153,6 +153,14 @@ spec:
         - --auto-compaction-retention={{ .Values.autoCompaction.retentionLength }}
         {{- end }}
 {{- end }}
+{{- if .Values.backup.leaderElection }}
+        {{- if .Values.backup.leaderElection.reelectionPeriod }}
+        - --etcd-connection-timeout-leader-election={{ .Values.backup.leaderElection.reelectionPeriod }}
+        {{- end }}
+        {{- if .Values.backup.leaderElection.etcdConnectionTimeout }}        
+        - --reelection-period={{ .Values.backup.leaderElection.etcdConnectionTimeout }}
+        {{- end }}
+{{- end }}
         image: {{ .Values.images.etcdBackupRestore.repository }}:{{ .Values.images.etcdBackupRestore.tag }}
         imagePullPolicy: {{ .Values.images.etcdBackupRestore.pullPolicy }}
         ports:
