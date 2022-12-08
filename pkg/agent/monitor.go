@@ -20,6 +20,8 @@ const (
 	Unknown
 )
 
+//go:generate stringer -type=EtcdMemberState
+
 const (
 	// NoLeaderState defines the state when etcd returns LeaderID as 0.
 	NoLeaderState uint64 = 0
@@ -29,9 +31,13 @@ type EtcdMaintenanceClientCreatorFn func(*brtypes.EtcdConnectionConfig) (client.
 
 type EtcdMonitor interface {
 	Run(ctx context.Context) error
+	EtcdStateNotifier
+	Close()
+}
+
+type EtcdStateNotifier interface {
 	Subscribe(name string) <-chan EtcdMemberState
 	Unsubscribe(name string)
-	Close()
 }
 
 func NewEtcdMonitor(etcdConnectionConfig *brtypes.EtcdConnectionConfig, clientCreatorFn EtcdMaintenanceClientCreatorFn, etcdConnectionTimeout time.Duration, pollInterval time.Duration) (EtcdMonitor, error) {
