@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gardener/etcd-backup-restore/pkg/agent"
 	etcdErr "github.com/gardener/etcd-backup-restore/pkg/errors"
+	"github.com/gardener/etcd-backup-restore/pkg/monitor"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/coordination/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -23,7 +23,7 @@ type HeartbeatHandler interface {
 	Run(context.Context) error
 }
 
-func NewHeartbeatHandler(etcdStateNotifier agent.EtcdStateNotifier, clientSet client.Client, metadata map[string]string, podName string, namespace string, k8sClientOpsTimeout time.Duration, logger *logrus.Entry) HeartbeatHandler {
+func NewHeartbeatHandler(etcdStateNotifier monitor.EtcdStateNotifier, clientSet client.Client, metadata map[string]string, podName string, namespace string, k8sClientOpsTimeout time.Duration, logger *logrus.Entry) HeartbeatHandler {
 	notifierCh := etcdStateNotifier.Subscribe("heartbeat-handler")
 
 	return &heartbeatHandler{
@@ -46,9 +46,9 @@ type heartbeatHandler struct {
 	k8sClientOpsTimeout time.Duration
 	podName             string
 	podNamespace        string
-	etcdStateNotifier   agent.EtcdStateNotifier
-	notifierCh          <-chan agent.EtcdMemberState
-	etcdMemberstate     *agent.EtcdMemberState
+	etcdStateNotifier   monitor.EtcdStateNotifier
+	notifierCh          <-chan monitor.EtcdMemberState
+	etcdMemberstate     *monitor.EtcdMemberState
 	metadata            map[string]string // metadata is currently added as annotations to the k8s lease object
 }
 
