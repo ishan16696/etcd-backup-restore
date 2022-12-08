@@ -14,14 +14,26 @@
 
 package errors
 
+import "fmt"
+
+type ErrorCode int
+
+const (
+	ErrorFetchingEtcdStatus ErrorCode = iota
+	NoEtcLeader
+)
+
+//go:generate stringer -type=ErrorCode -linecomment
+
 // EtcdError is struct to categorize errors occurred while processing etcd realted operations
 type EtcdError struct {
-	Message   string
-	operation string
+	Code    ErrorCode
+	Message string
+	Err     error
 }
 
-func (e *EtcdError) Error() string {
-	return e.Message
+func (e EtcdError) Error() string {
+	return fmt.Sprintf("code: %s, message: %s, err: %s", e.Code, e.Message, e.Err.Error())
 }
 
 // SnapstoreError is struct to categorize errors occurred while processing snapstore realted operations

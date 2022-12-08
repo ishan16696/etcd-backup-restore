@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	. "github.com/gardener/etcd-backup-restore/pkg/errors"
 	"github.com/gardener/etcd-backup-restore/pkg/etcdutil/client"
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 	"github.com/sirupsen/logrus"
@@ -16,6 +17,7 @@ const (
 	Leader EtcdMemberState = iota
 	Follower
 	Learner
+	Unknown
 )
 
 const (
@@ -23,28 +25,16 @@ const (
 	NoLeaderState uint64 = 0
 )
 
-type memberInfo struct {
-	etcdMemberState EtcdMemberState
-	message         string
-}
-
-type NotificationType int
-
-const (
-	LeaderChangeNotification NotificationType = iota
-	MemberStateChangeNotification
-	AlarmNotification
-)
-
 type EtcdMaintenanceClientCreatorFn func(*brtypes.EtcdConnectionConfig) (client.MaintenanceCloser, error)
 
 type EtcdMonitor interface {
 	Run(ctx context.Context) error
-	Subscribe(string, NotificationType) <-chan Notification
+	Subscribe(name string) <-chan EtcdMemberState
+	Unsubscribe(name string)
 	Close()
 }
 
-func NewEtcdMonitor(etcdConnectionConfig *brtypes.EtcdConnectionConfig, clientCreatorFn EtcdMaintenanceClientCreatorFn, etcdConnectionTimeout time.Duration, pollInterval time.Duration, endpoints []string) (EtcdMonitor, error) {
+func NewEtcdMonitor(etcdConnectionConfig *brtypes.EtcdConnectionConfig, clientCreatorFn EtcdMaintenanceClientCreatorFn, etcdConnectionTimeout time.Duration, pollInterval time.Duration) (EtcdMonitor, error) {
 	client, err := clientCreatorFn(etcdConnectionConfig)
 	if err != nil {
 		return nil, err
@@ -54,20 +44,13 @@ func NewEtcdMonitor(etcdConnectionConfig *brtypes.EtcdConnectionConfig, clientCr
 		etcdClient:            client,
 		pollInterval:          pollInterval,
 		etcdConnectionTimeout: etcdConnectionTimeout,
-		endpoints:             endpoints,
-		subscriptions:         make(map[NotificationType][]subscribedChannel),
+		endpoints:             etcdConnectionConfig.Endpoints,
 	}, nil
 }
 
-type Notification struct {
-	MemberState EtcdMemberState
-	Message     string
-	Error       error
-}
-
-type subscribedChannel struct {
+type subscription struct {
 	subscriber string
-	ch         chan Notification
+	ch         chan EtcdMemberState
 }
 
 type etcdMonitor struct {
@@ -76,28 +59,31 @@ type etcdMonitor struct {
 	etcdConnectionTimeout time.Duration
 	etcdClient            client.MaintenanceCloser
 	endpoints             []string
-	subscriptions         map[NotificationType][]subscribedChannel
+	subscriptions         []subscription
 }
 
-func (em *etcdMonitor) Subscribe(name string, n NotificationType) <-chan Notification {
-	if ch := em.getSubscribedChannel(name, n); ch != nil {
+func (em *etcdMonitor) Unsubscribe(name string) {
+	// TODO Ishan to implement
+}
+
+func (em *etcdMonitor) Subscribe(name string) <-chan EtcdMemberState {
+	if ch := em.getSubscribedChannel(name); ch != nil {
 		return ch
 	}
-	ch := make(chan Notification, 1)
-	subscribedChannels := em.subscriptions[n]
-	subscribedChannels = append(subscribedChannels, subscribedChannel{subscriber: name, ch: ch})
+	ch := make(chan EtcdMemberState, 1)
+	em.subscriptions = append(em.subscriptions, subscription{subscriber: name, ch: ch})
 	return ch
 }
 
 func (em *etcdMonitor) Run(ctx context.Context) error {
+	defer em.Close()
 	for {
 		select {
 		case <-ctx.Done():
-			em.Close()
 			return ctx.Err()
-
 		case <-time.After(em.pollInterval):
-			em.pollEtcd(ctx)
+			etcdMemberState, _ := em.pollEtcd(ctx)
+			em.sendNotifications(etcdMemberState)
 		}
 	}
 }
@@ -107,19 +93,13 @@ func (em *etcdMonitor) Close() {
 		_ = em.etcdClient.Close()
 	}()
 
-	for _, subscribedChannels := range em.subscriptions {
-		for _, subscribedChannel := range subscribedChannels {
-			close(subscribedChannel.ch)
-		}
+	for _, subscribedChannel := range em.subscriptions {
+		close(subscribedChannel.ch)
 	}
 }
 
-func (em *etcdMonitor) getSubscribedChannel(name string, n NotificationType) <-chan Notification {
-	subscribedChannels, ok := em.subscriptions[n]
-	if !ok {
-		return nil
-	}
-	for _, subscribedCh := range subscribedChannels {
+func (em *etcdMonitor) getSubscribedChannel(name string) <-chan EtcdMemberState {
+	for _, subscribedCh := range em.subscriptions {
 		if subscribedCh.subscriber == name {
 			return subscribedCh.ch
 		}
@@ -127,42 +107,41 @@ func (em *etcdMonitor) getSubscribedChannel(name string, n NotificationType) <-c
 	return nil
 }
 
-func (em *etcdMonitor) pollEtcd(ctx context.Context) (memberInfo, error) {
-	var endPoint string
-
-	if len(em.endpoints) > 0 {
-		endPoint = em.endpoints[0]
-	} else {
-		return memberInfo{
-			message: fmt.Sprintf("some msg.."),
-		}, fmt.Errorf("etcd endpoints are not passed correctly")
-	}
-
+func (em *etcdMonitor) pollEtcd(ctx context.Context) (EtcdMemberState, error) {
 	ctx, cancelFn := context.WithTimeout(ctx, em.etcdConnectionTimeout)
 	defer cancelFn()
 
+	endPoint := em.endpoints[0]
 	response, err := em.etcdClient.Status(ctx, endPoint)
 	if err != nil {
-		return memberInfo{
-			message: fmt.Sprintf("some msg.."),
-		}, err
+		msg := "error fetching etcd status"
+		if response != nil {
+			msg = fmt.Sprintf("%s %v", msg, response.Errors)
+		}
+		return Unknown, EtcdError{
+			Code:    ErrorFetchingEtcdStatus,
+			Message: msg,
+			Err:     err,
+		}
 	}
 
 	if response.Header.GetMemberId() == response.Leader {
-		return memberInfo{
-			etcdMemberState: Leader,
-		}, nil
+		return Leader, nil
 	} else if response.Leader == NoLeaderState {
-		return memberInfo{
-			message: fmt.Sprintf("currently there is no etcd leader present may be due to etcd quorum loss or election is being held"),
-		}, nil
+		return Unknown, EtcdError{
+			Code:    NoEtcLeader,
+			Message: "Currently there is no etcd leader present. It may be due to etcd quorum loss or election being held",
+			Err:     nil,
+		}
 	} else if response.IsLearner {
-		return memberInfo{
-			etcdMemberState: Learner,
-		}, nil
+		return Learner, nil
 	}
 
-	return memberInfo{
-		etcdMemberState: Follower,
-	}, nil
+	return Follower, nil
+}
+
+func (em *etcdMonitor) sendNotifications(state EtcdMemberState) {
+	for _, s := range em.subscriptions {
+		s.ch <- state
+	}
 }
