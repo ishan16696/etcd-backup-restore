@@ -11,54 +11,72 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// EtcdMemberState represents different etcd member states.
 type EtcdMemberState int
 
 const (
+	// Leader indicates that this member is a leader.
 	Leader EtcdMemberState = iota
+	// Follower indicate that this member is a follower.
 	Follower
+	// Learner indicates that this member is a leaner.
 	Learner
+	// Unknown indicates that backup-restore is unable to determine the state of the etcd peer container.
 	Unknown
 )
 
 //go:generate stringer -type=EtcdMemberState
 
 const (
-	// NoLeaderState defines the state when etcd returns LeaderID as 0.
+	// NoLeaderState indicates that there is no leader. This could happen if a leader election is underway or there is a quorum loss.
 	NoLeaderState uint64 = 0
 )
 
+// EtcdMaintenanceClientCreatorFn is a function alias for a function which knows how to create a client.MaintenanceCloser given a brtypes.EtcdConnectionConfig.
 type EtcdMaintenanceClientCreatorFn func(*brtypes.EtcdConnectionConfig) (client.MaintenanceCloser, error)
 
+// EtcdMonitor is a facade to monitor etcd peer container and to send notifications to all subscribers on state of etcd.
+// This monitor will periodically poll the etcd container for its state and the received state is then sent to multicasted to all subscribers.
 type EtcdMonitor interface {
+	// Run starts the monitor which will start to poll the etcd container for its status.
 	Run(ctx context.Context) error
 	EtcdStateNotifier
+	// Close closes the monitor and also closes all subscribers.
 	Close()
 }
 
+// EtcdStateNotifier is facade which allows creating and removing subscriptions. Each subscriber starts to receive notifications on etcd state.
 type EtcdStateNotifier interface {
+	// Subscribe registers a consumer with a given name to receive etcd state notifications on a dedicated channel which is maintained by the monitor.
 	Subscribe(name string) <-chan EtcdMemberState
+	// Unsubscribe unregisters the consumer and closes its subscription. This consumer will no longer receive etcd state notifications.
 	Unsubscribe(name string)
 }
 
+// NewEtcdMonitor creates a new instance of EtcdMonitor.
 func NewEtcdMonitor(etcdConnectionConfig *brtypes.EtcdConnectionConfig, clientCreatorFn EtcdMaintenanceClientCreatorFn, etcdConnectionTimeout time.Duration, pollInterval time.Duration) (EtcdMonitor, error) {
-	client, err := clientCreatorFn(etcdConnectionConfig)
+	etcdClient, err := clientCreatorFn(etcdConnectionConfig)
 	if err != nil {
 		return nil, err
 	}
 
 	return &etcdMonitor{
-		etcdClient:            client,
+		etcdClient:            etcdClient,
 		pollInterval:          pollInterval,
 		etcdConnectionTimeout: etcdConnectionTimeout,
 		endpoints:             etcdConnectionConfig.Endpoints,
 	}, nil
 }
 
+// subscription represents a subscription for a consumer who has subscribed for etcd state notifications.
 type subscription struct {
+	// subscriber is the name of the subscriber. All subscribers should have unique name.
 	subscriber string
-	ch         chan EtcdMemberState
+	// ch is the channel on which the subscriber will receive etcd state notifications.
+	ch chan EtcdMemberState
 }
 
+// etcdMonitor implements EtcdMonitor interface.
 type etcdMonitor struct {
 	logger                *logrus.Entry
 	pollInterval          time.Duration
@@ -69,7 +87,19 @@ type etcdMonitor struct {
 }
 
 func (em *etcdMonitor) Unsubscribe(name string) {
-	// TODO Ishan to implement
+	index := -1
+	for i, s := range em.subscriptions {
+		if s.subscriber == name {
+			index = i
+			break
+		}
+	}
+	if index >= 0 {
+		// found the subscription, close the channel and remove the entry from the slice of subscriptions.
+		close(em.subscriptions[index].ch)
+		em.subscriptions[index] = em.subscriptions[0]
+		em.subscriptions = em.subscriptions[1:]
+	}
 }
 
 func (em *etcdMonitor) Subscribe(name string) <-chan EtcdMemberState {
@@ -88,7 +118,7 @@ func (em *etcdMonitor) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(em.pollInterval):
-			etcdMemberState, _ := em.pollEtcd(ctx)
+			etcdMemberState, _ := em.getEtcdState(ctx)
 			em.sendNotifications(etcdMemberState)
 		}
 	}
@@ -113,7 +143,7 @@ func (em *etcdMonitor) getSubscribedChannel(name string) <-chan EtcdMemberState 
 	return nil
 }
 
-func (em *etcdMonitor) pollEtcd(ctx context.Context) (EtcdMemberState, error) {
+func (em *etcdMonitor) getEtcdState(ctx context.Context) (EtcdMemberState, error) {
 	ctx, cancelFn := context.WithTimeout(ctx, em.etcdConnectionTimeout)
 	defer cancelFn()
 
