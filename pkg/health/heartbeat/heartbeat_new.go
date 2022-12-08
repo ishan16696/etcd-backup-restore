@@ -19,14 +19,17 @@ var (
 	errEtcdStateNotifierChClosed = errors.New("etcdState notifier channel is closed")
 )
 
-type HeartbeatHandler interface {
+// LeaseUpdater updates the lease for this etcd member. A lease represents a heartbeat which needs to be renewed periodically which indicates that the member is live.
+type LeaseUpdater interface {
+	// Run starts a loop which periodically renews/updates the lease for this etcd member.
 	Run(context.Context) error
 }
 
-func NewHeartbeatHandler(etcdStateNotifier monitor.EtcdStateNotifier, clientSet client.Client, metadata map[string]string, podName string, namespace string, k8sClientOpsTimeout time.Duration, logger *logrus.Entry) HeartbeatHandler {
-	notifierCh := etcdStateNotifier.Subscribe("heartbeat-handler")
+// NewLeaseUpdater creates a new LeaseUpdater.
+func NewLeaseUpdater(etcdStateNotifier monitor.EtcdStateNotifier, clientSet client.Client, metadata map[string]string, podName string, podNamespace string, k8sClientOpsTimeout time.Duration, logger *logrus.Entry) LeaseUpdater {
+	notifierCh := etcdStateNotifier.Subscribe("heartbeat-leaseUpdater")
 
-	return &heartbeatHandler{
+	return &leaseUpdater{
 		etcdStateNotifier:   etcdStateNotifier,
 		k8sClient:           clientSet,
 		podName:             podName,
@@ -38,8 +41,8 @@ func NewHeartbeatHandler(etcdStateNotifier monitor.EtcdStateNotifier, clientSet 
 	}
 }
 
-// heartbeatHandler contains information to perform regular heart beats in a Kubernetes cluster.
-type heartbeatHandler struct {
+// leaseUpdater implements LeaseUpdater.
+type leaseUpdater struct {
 	logger              *logrus.Entry
 	renewDuration       time.Duration
 	k8sClient           client.Client
@@ -48,14 +51,14 @@ type heartbeatHandler struct {
 	podNamespace        string
 	etcdStateNotifier   monitor.EtcdStateNotifier
 	notifierCh          <-chan monitor.EtcdMemberState
-	etcdMemberstate     *monitor.EtcdMemberState
+	etcdMemberState     *monitor.EtcdMemberState
 	metadata            map[string]string // metadata is currently added as annotations to the k8s lease object
 }
 
-func (h *heartbeatHandler) Run(ctx context.Context) error {
+func (lu *leaseUpdater) Run(ctx context.Context) error {
 	go func() {
-		if err := h.etcdMemberStateWatcher(ctx); err != nil {
-			h.logger.Errorf("etcdMemberState watcher has been closed: %v", err)
+		if err := lu.etcdMemberStateWatcher(ctx); err != nil {
+			lu.logger.Errorf("etcdMemberState watcher has been closed: %v", err)
 			// TODO: Check if we need handle the closing of notifier channel.
 			// If yes, then we need to create drain and close functionality in etcd monitor.
 		}
@@ -64,65 +67,89 @@ func (h *heartbeatHandler) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			h.logger.Error("exiting heartbeatHandler: %v", ctx.Err())
+			lu.logger.Error("context has been cancelled, exiting leaseUpdater: %v", ctx.Err())
 			return ctx.Err()
-		case <-time.After(h.renewDuration):
-			if err := h.renewMemberLease(ctx); err != nil {
-				h.logger.Error(err)
+		case <-time.After(lu.renewDuration):
+			if lu.canRenewLease() {
+				if err := lu.renewMemberLease(ctx); err != nil {
+					lu.logger.Error(err)
+				}
 			}
 		}
 	}
 }
 
-func (h *heartbeatHandler) etcdMemberStateWatcher(ctx context.Context) error {
+func (lu *leaseUpdater) etcdMemberStateWatcher(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case etcdMemberState, ok := <-h.notifierCh:
+		case etcdMemberState, ok := <-lu.notifierCh:
 			if !ok {
 				return errEtcdStateNotifierChClosed
 			}
-			h.etcdMemberstate = &etcdMemberState
+			lu.etcdMemberState = &etcdMemberState
 		}
 	}
 }
 
-func (h *heartbeatHandler) renewMemberLease(pCtx context.Context) error {
+func (lu *leaseUpdater) renewMemberLease(parentCtx context.Context) error {
+	existingMemberLease, err := lu.getMemberLease(parentCtx)
+	if err != nil {
+		return err
+	}
+	newMemberLease := lu.createNewMemberLease(existingMemberLease)
+	return lu.patchMemberLease(parentCtx, existingMemberLease, newMemberLease)
+}
 
-	ctx, cancel := context.WithTimeout(pCtx, h.k8sClientOpsTimeout)
+func (lu *leaseUpdater) canRenewLease() bool {
+	return lu.etcdMemberState != nil && *lu.etcdMemberState != monitor.Unknown
+}
+
+func (lu *leaseUpdater) getMemberLease(parentCtx context.Context) (*v1.Lease, error) {
+	ctx, cancel := context.WithTimeout(parentCtx, lu.k8sClientOpsTimeout)
 	defer cancel()
 
 	// Fetch lease associated with member
 	memberLease := &v1.Lease{}
-	err := h.k8sClient.Get(ctx, client.ObjectKey{
-		Namespace: h.podNamespace,
-		Name:      h.podName,
+	err := lu.k8sClient.Get(ctx, client.ObjectKey{
+		Namespace: lu.podNamespace,
+		Name:      lu.podName,
 	}, memberLease)
 	if err != nil {
-		return &etcdErr.EtcdError{
+		return nil, &etcdErr.EtcdError{
 			Err:     err,
 			Message: fmt.Sprintf("Could not fetch member lease: %v", err),
 		}
 	}
+	return memberLease, nil
+}
 
+func (lu *leaseUpdater) createNewMemberLease(existingMemberLease *v1.Lease) *v1.Lease {
 	// Change HolderIdentity and RenewTime of lease
-	renewedMemberLease := memberLease.DeepCopy()
-	renewedMemberLease.Spec.HolderIdentity = pointer.StringPtr(fmt.Sprint(h.etcdMemberstate))
+	newMemberLease := existingMemberLease.DeepCopy()
+	newMemberLease.Spec.HolderIdentity = pointer.StringPtr(fmt.Sprint(lu.etcdMemberState))
 
 	// Update only keys from metadata
-	if renewedMemberLease.Annotations == nil {
-		renewedMemberLease.Annotations = map[string]string{}
+	if newMemberLease.Annotations == nil {
+		newMemberLease.Annotations = map[string]string{}
 	}
-	for k, v := range h.metadata {
-		renewedMemberLease.Annotations[k] = v
+	for k, v := range lu.metadata {
+		newMemberLease.Annotations[k] = v
 	}
 
 	// Renew the lease time
 	renewedTime := time.Now()
-	renewedMemberLease.Spec.RenewTime = &metav1.MicroTime{Time: renewedTime}
+	newMemberLease.Spec.RenewTime = &metav1.MicroTime{Time: renewedTime}
 
-	err = h.k8sClient.Patch(ctx, renewedMemberLease, client.MergeFrom(memberLease))
+	return newMemberLease
+}
+
+func (lu *leaseUpdater) patchMemberLease(parentCtx context.Context, existingMemberLease *v1.Lease, renewedMemberLease *v1.Lease) error {
+	ctx, cancel := context.WithTimeout(parentCtx, lu.k8sClientOpsTimeout)
+	defer cancel()
+
+	err := lu.k8sClient.Patch(ctx, renewedMemberLease, client.MergeFrom(existingMemberLease))
 	if err != nil {
 		return &etcdErr.EtcdError{
 			Err:     err,
